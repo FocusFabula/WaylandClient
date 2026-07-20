@@ -1,12 +1,11 @@
-use core::time;
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::thread::sleep;
 
 // local Objects ID's
 const WL_COMPOSITOR: u32 = 4;
@@ -17,6 +16,9 @@ const XDG_WM_BASE: u32 = 6;
 const WL_SURFACE: u32 = 8;
 const XDG_SURFACE: u32 = 10;
 const XDG_TOPLEVEL: u32 = 12;
+const SHM_POOL: u32 = 13;
+const WL_BUFFER: u32 = 14;
+
 fn connect_to_socket() -> Result<UnixStream, &'static str> {
     let env_name = "XDG_RUNTIME_DIR";
     let wayland_dir = match env::var(env_name) {
@@ -87,6 +89,32 @@ impl WaylandFrame {
             opcode,
             arguments: payload,
         })
+    }
+
+    fn try_parse(buffer: &mut Vec<u8>) -> std::io::Result<Option<Self>> {
+        if buffer.len() < 8 {
+            return Ok(None);
+        }
+        let id = u32::from_ne_bytes(buffer[0..4].try_into().unwrap());
+        let opcode = u16::from_ne_bytes(buffer[4..6].try_into().unwrap());
+        let total_size = u16::from_ne_bytes(buffer[6..8].try_into().unwrap());
+
+        if total_size < 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Za mały rozmiar ramki",
+            ));
+        }
+        if buffer.len() < total_size as usize {
+            return Ok(None);
+        }
+        let mut raw_frame: Vec<u8> = buffer.drain(0..total_size as usize).collect();
+        let payload = raw_frame.split_off(8);
+        Ok(Some(Self {
+            id,
+            opcode,
+            arguments: payload,
+        }))
     }
 }
 
@@ -227,7 +255,138 @@ enum StateMachine {
     MainLoop,
 }
 
+struct WaylandConnect {
+    stream: UnixStream,
+    frame_buffer: Vec<WaylandFrame>,
+    buffer: Vec<u8>,
+    objects: Vec<u32>,
+    next_id: u32,
+    wl_compositor: Option<u32>,
+    wl_shm: Option<u32>,
+    xdg_wm_base: Option<u32>,
+    free_id: Vec<u32>,
+}
+
+impl WaylandConnect {
+    fn init() -> std::io::Result<Self> {
+        let env_name = "XDG_RUNTIME_DIR";
+        let wayland_dir = match env::var(env_name) {
+            Ok(val) => val,
+            Err(_) => "".to_string(),
+        };
+        if wayland_dir.is_empty() {
+            panic!("Brak możliwości znalezienia XDG_RUNTIME_DIR");
+        }
+        let wayland_display = match env::var("WAYLAND_DISPLAY") {
+            Ok(val) => val,
+            Err(_) => "wayland-0".to_string(),
+        };
+        let mut path = PathBuf::from(wayland_dir);
+        path.push(wayland_display);
+        let stream = UnixStream::connect(path)?;
+        Ok(WaylandConnect {
+            stream,
+            buffer: Vec::new(),
+            frame_buffer: Vec::new(),
+            objects: vec![2],
+            next_id: 3,
+            wl_compositor: None,
+            wl_shm: None,
+            xdg_wm_base: None,
+            free_id: Vec::new(),
+        })
+    }
+
+    fn new_id(&mut self) -> u32 {
+        let id = self.free_id.pop().unwrap_or_else(|| {
+            let current = self.next_id;
+            self.next_id = current + 1;
+            current
+        });
+        self.objects.push(id);
+        id
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        let mut sync = FrameEncoder::new();
+        let id = self.new_id();
+
+        sync.write_uint(id);
+        let sync_message = WaylandFrame::new(1, 0, sync.get_buffer());
+        println!("Sync: {:?} id {}", &sync_message.serialize(), id);
+        self.stream.write_all(&sync_message.serialize())?;
+        self.stream.flush()?;
+        loop {
+            if let Some(frame) = self.read_frame()? {
+                if frame.id == id && frame.opcode == 0 {
+                    println!("{:?}", frame);
+                    break;
+                }
+                self.frame_buffer.push(frame);
+            }
+        }
+        Ok(())
+    }
+
+    fn read_frame(&mut self) -> std::io::Result<Option<WaylandFrame>> {
+        loop {
+            if let Some(frame) = WaylandFrame::try_parse(&mut self.buffer)? {
+                return Ok(Some(frame));
+            }
+
+            let mut temp_buffer = [0u8; 4096];
+            let bytes = self.stream.read(&mut temp_buffer)?;
+
+            if bytes == 0 {
+                return Ok(None);
+            }
+            self.buffer.extend_from_slice(&temp_buffer[0..bytes]);
+        }
+    }
+
+    fn read(&mut self) -> std::io::Result<Option<WaylandFrame>> {
+        if !self.frame_buffer.is_empty() {
+            return Ok(Some(self.frame_buffer.remove(0)));
+        }
+        self.read_frame()
+    }
+
+    fn get_registry(&mut self) -> std::io::Result<()> {
+        let mut new_request = FrameEncoder::new();
+        new_request.write_uint(2);
+        let new_message = WaylandFrame::new(1, 1, new_request.get_buffer());
+        self.stream.write_all(&new_message.serialize())?;
+        self.stream.flush()?;
+
+        self.sync()?;
+        loop {
+            if let Some(read_message) = self.read()? {
+                let mut decoder = FrameDecoder::new(read_message.arguments);
+                let name = decoder.read_uint();
+                let interface = decoder.read_string();
+                if interface == "wl_compositor" {
+                    self.wl_compositor = Some(name);
+                } else if interface == "wl_shm" {
+                    self.wl_shm = Some(name);
+                } else if interface == "xdg_wm_base" {
+                    self.xdg_wm_base = Some(name);
+                }
+                let version = decoder.read_uint();
+                println!("name: {name} \n interface: {interface} \n version: {version}");
+                if self.wl_compositor != None && self.wl_shm != None && self.xdg_wm_base != None {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
 fn main() {
+    // test
+    let mut test_connection = WaylandConnect::init().unwrap();
+    test_connection.get_registry();
+    test_connection.sync();
+    println!("=== Test refactor ===");
     // connect to socket
     let mut stream = connect_to_socket().unwrap();
 
@@ -261,12 +420,11 @@ fn main() {
                 state = StateMachine::GetRegistry;
             }
             StateMachine::GetRegistry => {
-                println!("test");
                 // read message
                 let read_message = WaylandFrame::read_from_stream(&mut stream).unwrap();
                 let current_id = read_message.id;
 
-                // error from get_gegistry
+                // error from get_registry
                 if current_id == 3 {
                     break;
                 }
@@ -450,7 +608,7 @@ fn main() {
 
                 // Tworzenie puli SHM (create_pool na obiekcie wl_shm [5])
                 let mut enc_pool = FrameEncoder::new();
-                enc_pool.write_uint(13); // ID nowej puli = 11
+                enc_pool.write_uint(SHM_POOL); // ID nowej puli = 11
                 enc_pool.write_uint(size as u32);
                 let serialized = WaylandFrame::new(WL_SHM, 0, enc_pool.get_buffer()).serialize();
 
@@ -504,18 +662,18 @@ fn main() {
                     }
                 };
                 let mut enc_buf = FrameEncoder::new();
-                enc_buf.write_uint(14); // ID naszego nowego wl_buffer
+                enc_buf.write_uint(WL_BUFFER); // ID naszego nowego wl_buffer
                 enc_buf.write_int(0); // offset w pamięci (zaczynamy od zera)
                 enc_buf.write_int(width.unwrap() as i32);
                 enc_buf.write_int(height.unwrap() as i32);
                 enc_buf.write_int((width.unwrap() * 4) as i32); // stride (bajty na linię)
                 enc_buf.write_uint(0); // Format: 0 reprezentuje zazwyczaj WL_SHM_FORMAT_XRGB8888
 
-                let msg_buf = WaylandFrame::new(13, 0, enc_buf.get_buffer());
+                let msg_buf = WaylandFrame::new(SHM_POOL, 0, enc_buf.get_buffer());
                 stream.write_all(&msg_buf.serialize()).unwrap();
 
                 let mut enc_attach = FrameEncoder::new();
-                enc_attach.write_uint(14); // ID naszego wl_buffer
+                enc_attach.write_uint(WL_BUFFER); // ID naszego wl_buffer
                 enc_attach.write_int(0); // x offset na ekranie
                 enc_attach.write_int(0); // y offset na ekranie
                 let msg_attach = WaylandFrame::new(WL_SURFACE, 1, enc_attach.get_buffer());
