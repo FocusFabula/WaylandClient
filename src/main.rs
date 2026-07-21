@@ -202,7 +202,7 @@ impl WaylandBuffer {
             return Err(std::io::Error::last_os_error());
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        file.set_len(size as u64);
+        file.set_len(size as u64).unwrap();
 
         // Przepisane na libc::mmap
         let ptr = unsafe {
@@ -261,9 +261,9 @@ struct WaylandConnect {
     buffer: Vec<u8>,
     objects: Vec<u32>,
     next_id: u32,
-    wl_compositor: Option<u32>,
-    wl_shm: Option<u32>,
-    xdg_wm_base: Option<u32>,
+    wl_compositor: u32,
+    wl_shm: u32,
+    xdg_wm_base: u32,
     free_id: Vec<u32>,
 }
 
@@ -290,9 +290,9 @@ impl WaylandConnect {
             frame_buffer: Vec::new(),
             objects: vec![2],
             next_id: 3,
-            wl_compositor: None,
-            wl_shm: None,
-            xdg_wm_base: None,
+            wl_compositor: 0,
+            wl_shm: 0,
+            xdg_wm_base: 0,
             free_id: Vec::new(),
         })
     }
@@ -320,6 +320,8 @@ impl WaylandConnect {
             if let Some(frame) = self.read_frame()? {
                 if frame.id == id && frame.opcode == 0 {
                     println!("{:?}", frame);
+                    self.free_id.push(id);
+                    self.objects.pop();
                     break;
                 }
                 self.frame_buffer.push(frame);
@@ -351,40 +353,106 @@ impl WaylandConnect {
         self.read_frame()
     }
 
-    fn get_registry(&mut self) -> std::io::Result<()> {
+    fn bind_global(
+        &mut self,
+        global_number: u32,
+        version: u32,
+        name: &str,
+        local_id: u32,
+    ) -> std::io::Result<()> {
+        let mut global_frame = FrameEncoder::new();
+        global_frame.write_uint(global_number);
+        global_frame.write_string(name);
+        global_frame.write_uint(version);
+        global_frame.write_uint(local_id);
+        let msg_frame = WaylandFrame::new(2, 0, global_frame.get_buffer());
+        println!("wl_compositor: {:?}", &msg_frame.serialize());
+        self.stream.write_all(&msg_frame.serialize())?;
+        Ok(())
+    }
+
+    fn bind_registry(&mut self) -> std::io::Result<()> {
         let mut new_request = FrameEncoder::new();
         new_request.write_uint(2);
         let new_message = WaylandFrame::new(1, 1, new_request.get_buffer());
         self.stream.write_all(&new_message.serialize())?;
         self.stream.flush()?;
 
-        self.sync()?;
         loop {
             if let Some(read_message) = self.read()? {
                 let mut decoder = FrameDecoder::new(read_message.arguments);
-                let name = decoder.read_uint();
+
+                let number = decoder.read_uint();
                 let interface = decoder.read_string();
-                if interface == "wl_compositor" {
-                    self.wl_compositor = Some(name);
-                } else if interface == "wl_shm" {
-                    self.wl_shm = Some(name);
-                } else if interface == "xdg_wm_base" {
-                    self.xdg_wm_base = Some(name);
-                }
                 let version = decoder.read_uint();
-                println!("name: {name} \n interface: {interface} \n version: {version}");
-                if self.wl_compositor != None && self.wl_shm != None && self.xdg_wm_base != None {
-                    break;
+
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        self.wl_compositor = self.new_id();
+                        self.bind_global(number, version, "wl_compositor", self.wl_compositor)?;
+                    }
+                    "wl_shm" => {
+                        self.wl_shm = self.new_id();
+                        self.bind_global(number, version, "wl_shm", self.wl_shm)?;
+                    }
+                    "xdg_wm_base" => {
+                        self.xdg_wm_base = self.new_id();
+                        self.bind_global(number, version, "xdg_wm_base", self.xdg_wm_base)?;
+                    }
+                    _ => {
+                        if self.wl_compositor != 0 && self.wl_shm != 0 && self.xdg_wm_base != 0 {
+                            break;
+                        }
+                    }
                 }
+                println!("name: {number} \n interface: {interface} \n version: {version}");
             }
         }
+
+        self.sync()?;
+        Ok(())
+    }
+
+    fn wl_surface(&mut self) -> std::io::Result<u32> {
+        let id = self.new_id();
+        let mut enc_surf = FrameEncoder::new();
+        enc_surf.write_uint(id);
+        let msg_surf = WaylandFrame::new(WL_COMPOSITOR, 0, enc_surf.get_buffer());
+        self.stream.write_all(&msg_surf.serialize())?;
+        Ok(id)
+    }
+
+    fn xdg_surface(&mut self, surface_id: u32) -> std::io::Result<u32> {
+        let id = self.new_id();
+        let mut enc_xdg = FrameEncoder::new();
+        enc_xdg.write_uint(id); // Nasze nowe ID dla xdg_surface
+        enc_xdg.write_uint(surface_id); // Istniejąca wl_surface
+        let msg_xdg = WaylandFrame::new(self.xdg_wm_base, 2, enc_xdg.get_buffer());
+        self.stream.write_all(&msg_xdg.serialize())?;
+        Ok(id)
+    }
+
+    fn xdg_toplevel(&mut self, xdg_surface: u32) -> std::io::Result<u32> {
+        let id = self.new_id();
+        let mut enc_top = FrameEncoder::new();
+        enc_top.write_uint(id); // Nasze nowe ID dla xdg_toplevel
+        let msg_top = WaylandFrame::new(xdg_surface, 1, enc_top.get_buffer());
+        self.stream.write_all(&msg_top.serialize())?;
+        Ok(id)
+    }
+
+    fn wl_curface_commit(&mut self, wl_surface_id: u32) -> std::io::Result<()> {
+        let enc_commit = FrameEncoder::new();
+        let msg_commit = WaylandFrame::new(wl_surface_id, 6, enc_commit.get_buffer());
+        self.stream.write_all(&msg_commit.serialize())?;
         Ok(())
     }
 }
 fn main() {
     // test
     let mut test_connection = WaylandConnect::init().unwrap();
-    test_connection.get_registry();
+    test_connection.bind_registry();
+    test_connection.sync();
     test_connection.sync();
     println!("=== Test refactor ===");
     // connect to socket
