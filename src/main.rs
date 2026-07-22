@@ -255,6 +255,20 @@ enum StateMachine {
     MainLoop,
 }
 
+enum WaylandEvent {
+    Configure {
+        surface_id: u32,
+        width: u32,
+        height: u32,
+    },
+    WindowResize {
+        surface_id: u32,
+    },
+    WindowClose {
+        surface_id: u32,
+    },
+}
+
 struct WaylandConnect {
     stream: UnixStream,
     frame_buffer: Vec<WaylandFrame>,
@@ -446,6 +460,10 @@ impl WaylandConnect {
         let msg_commit = WaylandFrame::new(wl_surface_id, 6, enc_commit.get_buffer());
         self.stream.write_all(&msg_commit.serialize())?;
         Ok(())
+    }
+
+    fn event_pool(&self) -> std::io::Result<WaylandEvent> {
+        todo!();
     }
 }
 fn main() {
