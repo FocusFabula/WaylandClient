@@ -384,10 +384,11 @@ impl WaylandConnect {
     fn read(&mut self) -> std::io::Result<Option<WaylandFrame>> {
         if !self.frame_buffer.is_empty() {
             let frame = self.frame_buffer.remove(0);
-            //println!("{:?}", frame);
+            println!("{:?}", frame);
             return Ok(Some(frame));
         }
         let frame = self.read_frame();
+        println!("{:?}", frame);
         frame
     }
 
@@ -511,6 +512,7 @@ impl WaylandConnect {
                     let mut enc_event = FrameDecoder::new(event_frame.arguments);
                     let width = enc_event.read_uint();
                     let height = enc_event.read_uint();
+                    println!("Window {} x {}", &width, &height);
                     Ok(Some(WaylandEvent::ConfigureTopLevel {
                         surface_id: event_frame.id,
                         width,
@@ -542,21 +544,31 @@ impl WaylandConnect {
         event_channel: &mpsc::Sender<Option<WaylandEvent>>,
         cmd_event: &mpsc::Receiver<CmdConnect>,
     ) -> std::io::Result<()> {
-        match cmd_event.recv().unwrap() {
-            CmdConnect::render {
-                width,
-                height,
-                serial,
-                xdg_surface_id,
-                buffer_fd,
-            } => {
-                self.present_window(width, height, serial, xdg_surface_id, buffer_fd);
+        if let Ok(cmd) = cmd_event.try_recv() {
+            println!("Event: {:?}", cmd);
+            match cmd {
+                CmdConnect::render {
+                    width,
+                    height,
+                    serial,
+                    xdg_surface_id,
+                    buffer_fd,
+                } => {
+                    println!("próba tworzenia okna");
+                    self.present_window(width, height, serial, xdg_surface_id, buffer_fd)
+                        .unwrap();
+                }
             }
-        };
+        }
+
+        println!("Test");
         if let Some(event_frame) = self.read_frame()? {
             // ping event
             // getting serial number from ping
+
+            println!("{:?}", event_frame);
             if self.xdg_wm_base == event_frame.id {
+                println!("PING");
                 let ping_serial =
                     u32::from_ne_bytes(event_frame.arguments[0..4].try_into().unwrap());
                 //making pong request
@@ -567,13 +579,20 @@ impl WaylandConnect {
                 self.stream.flush()?;
                 return Ok(());
             } else {
+                println!("Wysyłam");
                 event_channel.send(self.get_event(event_frame)?).unwrap();
                 return Ok(());
             }
         }
         return Ok(());
     }
-
+    pub fn ack_configure(&mut self, xdg_surface_id: u32, serial: u32) -> std::io::Result<()> {
+        let mut enc = FrameEncoder::new();
+        enc.write_uint(serial);
+        let msg = WaylandFrame::new(xdg_surface_id, 4, enc.get_buffer());
+        self.stream.write_all(&msg.serialize())?;
+        self.stream.flush()
+    }
     fn present_window(
         &mut self,
         width: u32,
@@ -582,6 +601,8 @@ impl WaylandConnect {
         xdg_surface: u32,
         buffer_fd: RawFd,
     ) -> std::io::Result<()> {
+        println!("Presenting a window");
+        self.ack_configure(xdg_surface, serial)?;
         let size = (width * height) as usize * 4;
         // Tworzenie puli SHM (create_pool na obiekcie wl_shm [5])
         self.wl_shm = self.new_id(WaylandObject::wlShm);
@@ -687,8 +708,8 @@ impl Window {
         let buf = WaylandBuffer::new(1024)?;
         Ok(Self {
             buffer: buf,
-            width: 0,
-            height: 0,
+            width: 640,
+            height: 480,
             serial: 0,
             xdg_surface,
             top_level_surface,
@@ -708,8 +729,12 @@ impl Window {
             chunk[3] = 255; // A
         }
     }
-    fn eventHandle(&mut self, event_channel: &mpsc::Receiver<Option<WaylandEvent>>) {
-        if let Ok(Some(event)) = event_channel.recv() {
+    fn eventHandle(
+        &mut self,
+        event_channel: &mpsc::Receiver<Option<WaylandEvent>>,
+        cmd_channel: &mpsc::Sender<CmdConnect>,
+    ) {
+        if let Ok(Some(event)) = event_channel.try_recv() {
             println!("Event: {:?}", event);
             match event {
                 WaylandEvent::ConfigureTopLevel {
@@ -721,23 +746,33 @@ impl Window {
                     if surface_id == self.top_level_surface {
                         self.width = width;
                         self.height = height;
+                        self.test(width, height);
                     }
-                    self.test(width, height);
                 }
                 WaylandEvent::ConfigureXdgSurface {
                     xdg_surface_id,
                     serial,
                 } => {
                     println!("Commit event");
+
+                    println!(
+                        "Porównanie ID -> odebrane: {}, moje: {}",
+                        xdg_surface_id, self.xdg_surface
+                    );
                     if xdg_surface_id == self.xdg_surface {
                         self.serial = serial;
-                        CmdConnect::render {
-                            width: self.width,
-                            height: self.height,
-                            serial,
-                            xdg_surface_id,
-                            buffer: self.buffer,
-                        };
+                        let res = cmd_channel
+                            .send(CmdConnect::render {
+                                width: self.width,
+                                height: self.height,
+                                serial,
+                                xdg_surface_id,
+                                buffer_fd: self.buffer.get_fd(),
+                            })
+                            .unwrap();
+                        println!("Res: {:?}", res);
+                    } else {
+                        println!("pomijamy");
                     }
                 }
                 _ => println!("no exists event: {:?}", event),
@@ -745,7 +780,7 @@ impl Window {
         }
     }
 }
-
+#[derive(Debug)]
 enum CmdConnect {
     render {
         width: u32,
@@ -773,12 +808,13 @@ fn main() {
     let top_level = test_connection.xdg_toplevel(xdg).unwrap();
     test_connection.wl_curface_commit(wl_surf);
     test_connection.sync();
+
     println!("=== Creating a window ===");
     let mut win = Window::init(xdg, top_level).unwrap();
     println!("=== Creating an event loop");
 
     let (tx_event, rx_event) = mpsc::channel::<Option<WaylandEvent>>();
-    let (tx_cmd, rx_cmd) = mpsc::channel::<Option<CmdConnect>>();
+    let (tx_cmd, rx_cmd) = mpsc::channel::<CmdConnect>();
     thread::spawn(move || {
         loop {
             test_connection.event_pool(&tx_event, &rx_cmd).unwrap();
@@ -786,7 +822,7 @@ fn main() {
     });
     println!("=== After an event loop ===");
     loop {
-        win.eventHandle(&rx_event);
+        win.eventHandle(&rx_event, &tx_cmd);
     }
 
     // // connect to socket
