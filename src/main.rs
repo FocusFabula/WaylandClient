@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -218,7 +219,36 @@ impl WaylandStream {
     }
 }
 
+enum WaylandObject {
+    WlDisplay,
+    WlCompositor,
+    XdgWmBase,
+    WlSurface,
+    XdgSurface,
+    XdgTopLevel,
+    WlShm,
+    WlShmPool,
+    WlBuffer,
+}
+
+struct ObjectManager {
+    next_id: u32,
+    free_id: Vec<u32>,
+    objects: HashMap<u32, WaylandObject>,
+}
+
+impl ObjectManager {
+    fn init() -> Self {
+        ObjectManager {
+            next_id: 2,
+            free_id: Vec::new(),
+            objects: HashMap::from([(1, WaylandObject::WlDisplay)]),
+        }
+    }
+}
+
 fn main() {
     let stream = WaylandStream::init().unwrap();
+
     println!("hello World");
 }
