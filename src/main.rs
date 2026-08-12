@@ -219,16 +219,21 @@ impl WaylandStream {
     }
 }
 
+#[derive(Clone, Copy)]
 enum WaylandObject {
+    // Global objects
+    WlRegistry,
     WlDisplay,
     WlCompositor,
     XdgWmBase,
-    WlSurface,
-    XdgSurface,
-    XdgTopLevel,
     WlShm,
-    WlShmPool,
-    WlBuffer,
+
+    // local objects binded to window
+    WlSurface { window_id: u32 },
+    XdgSurface { window_id: u32 },
+    XdgTopLevel { window_id: u32 },
+    WlShmPool { window_id: u32 },
+    WlBuffer { window_id: u32 },
 }
 
 struct ObjectManager {
@@ -244,6 +249,30 @@ impl ObjectManager {
             free_id: Vec::new(),
             objects: HashMap::from([(1, WaylandObject::WlDisplay)]),
         }
+    }
+    fn set_id(&mut self, obj: WaylandObject) -> u32 {
+        let id = self.free_id.pop().unwrap_or_else(|| {
+            let current_id = self.next_id;
+            self.next_id += 1;
+            current_id
+        });
+        self.objects.insert(id, obj);
+        id
+    }
+
+    fn from_frame(&self, frame: WaylandFrame) -> Option<WaylandObject> {
+        let id = frame.id;
+        let obj = self.objects.get(&id);
+        match obj {
+            Some(x) => return Some(*x),
+            None => return None,
+        }
+    }
+
+    fn pop(&mut self, frame: WaylandFrame) {
+        let id = frame.id;
+        self.objects.remove_entry(&id);
+        self.free_id.push(id);
     }
 }
 
