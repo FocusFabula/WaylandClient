@@ -205,7 +205,6 @@ impl WaylandStream {
                     self.stream.write_all(&req.serialize())?;
                     end = true;
                     println!("Packet recived");
-                    return Ok(());
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return Err(StreamError::Disconnected),
@@ -219,7 +218,7 @@ impl WaylandStream {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum WaylandObject {
     // Global objects
     WlRegistry,
@@ -250,7 +249,7 @@ impl ObjectManager {
             objects: HashMap::from([(1, WaylandObject::WlDisplay)]),
         }
     }
-    fn set_id(&mut self, obj: WaylandObject) -> u32 {
+    fn set_id_client(&mut self, obj: WaylandObject) -> u32 {
         let id = self.free_id.pop().unwrap_or_else(|| {
             let current_id = self.next_id;
             self.next_id += 1;
@@ -260,6 +259,10 @@ impl ObjectManager {
         id
     }
 
+    fn set_id_serv(&mut self, obj: WaylandObject, id: u32) {
+        let _ = self.objects.insert(id, obj);
+    }
+
     fn from_frame(&self, frame: WaylandFrame) -> Option<WaylandObject> {
         let id = frame.id;
         let obj = self.objects.get(&id);
@@ -267,6 +270,15 @@ impl ObjectManager {
             Some(x) => return Some(*x),
             None => return None,
         }
+    }
+
+    fn get_id(&mut self, obj: &WaylandObject) -> Option<u32> {
+        for (key, val) in self.objects.iter() {
+            if obj == val {
+                return Some(*key);
+            }
+        }
+        None
     }
 
     fn pop(&mut self, frame: WaylandFrame) {
